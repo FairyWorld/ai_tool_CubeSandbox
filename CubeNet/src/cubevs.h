@@ -25,6 +25,9 @@
 /* ARP hardware types */
 #define ARPHRD_ETHER			1	/* Ethernet */
 
+/* https://elixir.bootlin.com/linux/v5.4.217/source/include/linux/socket.h#L172 */
+#define AF_INET				2
+
 #define MAX_ENTRIES			8192
 #define MAX_IP_RULE_ENTRIES		8192
 #define MAX_DOMAIN_RULE_ENTRIES		1024
@@ -76,6 +79,8 @@ const volatile __u32 cube_l7_mark_mask = 0xFFFF0000u;
 const volatile __u32 cube_l7_mark_http = 0xCE010000u;
 const volatile __u32 cube_l7_mark_https = 0xCE020000u;
 #define DNS_QUERY_TRACK_TTL_NS		(10ULL * NSEC_PER_SEC)
+#define DIRECT_NEIGH_PROBE_INTERVAL_NS		(1ULL * NSEC_PER_SEC)
+#define DIRECT_NEIGH_REVALIDATE_INTERVAL_NS	(5ULL * 60 * NSEC_PER_SEC)
 
 /* https://en.wikipedia.org/wiki/IPv4#Header
  *
@@ -137,6 +142,7 @@ const volatile __u64 egress_redirect_flags  = BPF_F_INGRESS;
 
 /* Ifindex, IP and MAC address of Node itself */
 const volatile __u32 nodenic_ip         = 0x020a8709;	/* 9.135.10.2, network byte order */
+const volatile __u32 nodenic_netmask    = 0x00ffffff;	/* 255.255.255.0, packet-byte layout */
 const volatile __u32 nodenic_ifindex    = 2;
 const volatile __u32 nodenic_macaddr_p1 = 0x68005452;	/* 52:54:00:68:dd:16 */
 const volatile __u16 nodenic_macaddr_p2 = 0x16dd;
@@ -166,6 +172,17 @@ struct arphdr_eth {
 	unsigned char ar_tha[ETH_ALEN];	/* target hardware address */
 	__be32 ar_tip;			/* target IP address */
 } __attribute__((packed));
+
+struct arp_packet {
+	struct ethhdr eth;
+	struct arphdr_eth arp;
+} __attribute__((packed));
+
+struct direct_neighbor {
+	unsigned char addr[ETH_ALEN];
+	__u16 reserved;
+	__u64 next_probe_at_ns;
+};
 
 union macaddr {
 	struct {

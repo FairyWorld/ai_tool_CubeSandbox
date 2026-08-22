@@ -106,6 +106,155 @@ static __always_inline bool should_do_nat(const struct iphdr *l3)
 	return true;
 }
 
+/* Primary IPv4 prefix of the node NIC. Direct mode only. */
+static __always_inline bool direct_egress_is_onlink(__u32 daddr)
+{
+	return egress_redirect_flags == 0 &&
+	       (daddr & nodenic_netmask) == (nodenic_ip & nodenic_netmask);
+}
+
+static __always_inline bool direct_neighbor_is_zero(const struct direct_neighbor *neighbor)
+{
+	const union macaddr *macaddr = (const union macaddr *)neighbor->addr;
+
+	return macaddr->p1 == 0 && macaddr->p2 == 0;
+}
+
+#define DIRECT_ARP_PRESERVED_LEN	96
+#define DIRECT_ARP_HEADROOM	32
+#define DIRECT_ARP_FRAME_LEN		(DIRECT_ARP_PRESERVED_LEN + DIRECT_ARP_HEADROOM)
+#define DIRECT_ARP_ZERO_CHUNK_LEN	32
+
+static __always_inline long direct_egress_clear_arp_padding(struct __sk_buff *skb)
+{
+	unsigned char zeroes[DIRECT_ARP_ZERO_CHUNK_LEN] = {};
+	long err;
+
+	err = bpf_skb_store_bytes(skb, sizeof(struct arp_packet),
+				  zeroes, sizeof(zeroes), 0);
+	if (err)
+		return err;
+	err = bpf_skb_store_bytes(skb,
+				  sizeof(struct arp_packet) + DIRECT_ARP_ZERO_CHUNK_LEN,
+				  zeroes, sizeof(zeroes), 0);
+	if (err)
+		return err;
+	return bpf_skb_store_bytes(skb,
+				   sizeof(struct arp_packet) + 2 * DIRECT_ARP_ZERO_CHUNK_LEN,
+				   zeroes,
+				   DIRECT_ARP_FRAME_LEN - sizeof(struct arp_packet) -
+				   2 * DIRECT_ARP_ZERO_CHUNK_LEN, 0);
+}
+
+static __always_inline long direct_egress_arp_request(struct __sk_buff *skb, __u32 daddr)
+{
+	struct arp_packet packet = {};
+	union macaddr *macaddr;
+	long err;
+
+	__builtin_memset(packet.eth.h_dest, 0xff, ETH_ALEN);
+	macaddr = (union macaddr *)packet.eth.h_source;
+	macaddr->p1 = nodenic_macaddr_p1;
+	macaddr->p2 = nodenic_macaddr_p2;
+	packet.eth.h_proto = bpf_htons(ETH_P_ARP);
+
+	packet.arp.ar_hrd = bpf_htons(ARPHRD_ETHER);
+	packet.arp.ar_pro = bpf_htons(ETH_P_IP);
+	packet.arp.ar_hln = ETH_ALEN;
+	packet.arp.ar_pln = sizeof(__be32);
+	packet.arp.ar_op = bpf_htons(ARPOP_REQUEST);
+	macaddr = (union macaddr *)packet.arp.ar_sha;
+	macaddr->p1 = nodenic_macaddr_p1;
+	macaddr->p2 = nodenic_macaddr_p2;
+	packet.arp.ar_sip = nodenic_ip;
+	packet.arp.ar_tip = daddr;
+
+	/* CHECKSUM_PARTIAL can write L4 csum after we return.
+	 * change_tail will not shrink below that write (min_len).
+	 * change_head(32) moves it past ARP. Then store ARP and zero the rest.
+	 */
+	err = bpf_skb_change_tail(skb, DIRECT_ARP_PRESERVED_LEN, 0);
+	if (err)
+		return TC_ACT_SHOT;
+	err = bpf_skb_change_head(skb, DIRECT_ARP_HEADROOM, 0);
+	if (err)
+		return TC_ACT_SHOT;
+	err = bpf_skb_store_bytes(skb, 0, &packet, sizeof(packet), 0);
+	if (err)
+		return TC_ACT_SHOT;
+	err = direct_egress_clear_arp_padding(skb);
+	if (err)
+		return TC_ACT_SHOT;
+
+	return 0;
+}
+
+#define EGRESS_MAC_DROP		(-1)
+#define EGRESS_MAC_READY	0
+#define EGRESS_MAC_PROBE	1
+
+/* READY: L2 rewritten. PROBE: skb is now an ARP request. DROP: wait. */
+static __always_inline int prepare_egress_l2(struct __sk_buff *skb,
+					     struct ethhdr *l2, __u32 daddr)
+{
+	struct bpf_fib_lookup fib = {
+		.family = AF_INET,
+		.ifindex = nodenic_ifindex,
+		.ipv4_src = nodenic_ip,
+		.ipv4_dst = daddr,
+	};
+	struct direct_neighbor pending = {};
+	struct direct_neighbor *neighbor;
+	union macaddr *neighbor_mac;
+	const union macaddr *dmac;
+	const union macaddr *smac;
+	__u64 now;
+	long err;
+
+	if (!direct_egress_is_onlink(daddr)) {
+		set_mac_pair(l2, egress_smacaddr_p1, egress_smacaddr_p2,
+			     egress_dmacaddr_p1, egress_dmacaddr_p2);
+		return EGRESS_MAC_READY;
+	}
+
+	err = bpf_fib_lookup(skb, &fib, sizeof(fib),
+			     BPF_FIB_LOOKUP_DIRECT | BPF_FIB_LOOKUP_OUTPUT);
+	if (err == BPF_FIB_LKUP_RET_SUCCESS && fib.ifindex == nodenic_ifindex) {
+		smac = (const union macaddr *)fib.smac;
+		dmac = (const union macaddr *)fib.dmac;
+		set_mac_pair(l2, smac->p1, smac->p2, dmac->p1, dmac->p2);
+		return EGRESS_MAC_READY;
+	}
+
+	now = bpf_ktime_get_ns();
+	neighbor = bpf_map_lookup_elem(&direct_neigh, &daddr);
+	if (neighbor) {
+		if (neighbor->next_probe_at_ns > now) {
+			if (!direct_neighbor_is_zero(neighbor))
+				goto set_neighbor;
+			return EGRESS_MAC_DROP;
+		}
+
+		/* A concurrent learn may make this probe redundant, which is harmless. */
+		neighbor->next_probe_at_ns = now + DIRECT_NEIGH_PROBE_INTERVAL_NS;
+	} else {
+		pending.next_probe_at_ns = now + DIRECT_NEIGH_PROBE_INTERVAL_NS;
+		err = bpf_map_update_elem(&direct_neigh, &daddr, &pending, BPF_NOEXIST);
+		if (err)
+			return EGRESS_MAC_DROP;
+	}
+
+	if (direct_egress_arp_request(skb, daddr))
+		return EGRESS_MAC_DROP;
+	return EGRESS_MAC_PROBE;
+
+set_neighbor:
+	neighbor_mac = (union macaddr *)neighbor->addr;
+	set_mac_pair(l2, nodenic_macaddr_p1, nodenic_macaddr_p2,
+		     neighbor_mac->p1, neighbor_mac->p2);
+	return EGRESS_MAC_READY;
+}
+
 /* Egress flow classification now lives in classify_egress_flow() (session.h),
  * which merges the former l7_scheme_for_flow() and session_policy_allowed()
  * into a single policy verdict (reject / accept-SNAT / accept-HTTP /
@@ -115,6 +264,7 @@ static __always_inline bool should_do_nat(const struct iphdr *l3)
 enum tcp_nat_result {
 	TCP_NAT_DROP = 0,
 	TCP_NAT_OK,
+	TCP_NAT_PROBE,
 	TCP_NAT_RESET,
 	TCP_L7PROXY_OK,
 };
@@ -493,10 +643,6 @@ do_nat:
 	ip_hlen <<= 2;
 	icmp_csum_off = ICMP_CSUM_OFF(ip_hlen);
 
-	/* update L2 first: csum/store helpers may invalidate packet pointers */
-	set_mac_pair(l2, egress_smacaddr_p1, egress_smacaddr_p2,
-		     egress_dmacaddr_p1, egress_dmacaddr_p2);
-
 	/* update ICMP csum: ICMP has no pseudo-header, so no BPF_F_PSEUDO_HDR.
 	 * Only the echo identifier change affects the csum (IP saddr is not
 	 * covered by ICMP checksum).
@@ -594,10 +740,6 @@ do_nat:
 	ip_hlen = BPF_CORE_READ_BITFIELD(l3, ihl);
 	ip_hlen <<= 2;
 	udp_csum_off = UDP_CSUM_OFF(ip_hlen);
-
-	/* update L2 first: csum/store helpers may invalidate packet pointers */
-	set_mac_pair(l2, egress_smacaddr_p1, egress_smacaddr_p2,
-		     egress_dmacaddr_p1, egress_dmacaddr_p2);
 
 	/* update UDP csum only if it was non-zero (UDP csum is optional over IPv4).
 	 * BPF_F_MARK_MANGLED_0 keeps a 0 csum (= disabled) intact in case the
@@ -700,6 +842,8 @@ static __always_inline __u64 do_tcp_nat(struct __sk_buff *skb, struct mvm_meta *
 	__u8 packet_class = SNAT_PACKET;
 	__u8 l7_scheme = L7_SCHEME_NONE;
 	__u8 verdict = FLOW_SNAT;
+	bool create_snat = false;
+	int mac_result;
 	long err;
 	bool ok;
 
@@ -766,11 +910,10 @@ do_create:
 		return TCP_NAT_PACK(0, TCP_NAT_RESET);
 	case FLOW_SNAT:
 	default:
-		snat_ip = pick_snat_ip_port(mvm_meta->ip, &key, &snat_port);
-		if (!snat_ip || !snat_ip->ip || !snat_port)
-			return TCP_NAT_DROP;
-		break;
+		create_snat = true;
+		goto prepare_snat;
 	}
+create_session:
 	ok = create_new_sessions(skb, &key, now, skb->ingress_ifindex,
 				 snat_ip, snat_port, packet_class, l7_scheme);
 	if (!ok)
@@ -824,6 +967,35 @@ do_create:
 	}
 
 do_update:
+	if (sess->packet_class == L7PROXY_PACKET)
+		goto update_existing;
+
+prepare_snat:
+	/* Resolve external L2 before allocating or mutating TCP session state.
+	 * A cold miss consumes this packet as an ARP probe, so the original TCP
+	 * packet must remain untouched and a new session must not be installed.
+	 */
+	mac_result = prepare_egress_l2(skb, l2, key.dst_ip);
+	if (mac_result == EGRESS_MAC_DROP)
+		return TCP_NAT_DROP;
+	if (mac_result == EGRESS_MAC_PROBE)
+		return TCP_NAT_PACK(nodenic_ifindex, TCP_NAT_PROBE);
+
+	if (create_snat) {
+		snat_ip = pick_snat_ip_port(mvm_meta->ip, &key, &snat_port);
+		if (!snat_ip || !snat_ip->ip || !snat_port)
+			return TCP_NAT_DROP;
+		goto create_session;
+	}
+
+	/* prepare_egress_l2() may update the neighbor map. Reacquire the session
+	 * value before updating it or using it for the NAT rewrite.
+	 */
+	sess = bpf_map_lookup_elem(&egress_sessions, &key);
+	if (!sess || sess->packet_class == L7PROXY_PACKET)
+		return TCP_NAT_DROP;
+
+update_existing:
 	/* update session */
 	update_session(IP_CT_DIR_ORIGINAL, sess, now, syn, ack, fin, rst);
 
@@ -848,10 +1020,6 @@ do_nat:
 	ip_hlen = BPF_CORE_READ_BITFIELD(l3, ihl);
 	ip_hlen <<= 2;
 	tcp_csum_off = TCP_CSUM_OFF(ip_hlen);
-
-	/* update L2 first: csum/store helpers may invalidate packet pointers */
-	set_mac_pair(l2, egress_smacaddr_p1, egress_smacaddr_p2,
-		     egress_dmacaddr_p1, egress_dmacaddr_p2);
 
 	/* update TCP csum: IP saddr is part of pseudo-header, so BPF_F_PSEUDO_HDR */
 	flags = BPF_F_PSEUDO_HDR | sizeof(old_saddr);
@@ -1005,6 +1173,7 @@ int from_cube(struct __sk_buff *skb)
 	struct iphdr *l3;
 	struct tcphdr *l4;
 	struct udphdr *udp;
+	int mac_result;
 	__u16 *host_port;
 	__u32 dns_off;
 	__u8 proto;
@@ -1112,11 +1281,20 @@ int from_cube(struct __sk_buff *skb)
 		tcp_ret = do_tcp_nat(skb, mvm_meta);
 		if (TCP_NAT_STATUS(tcp_ret) == TCP_NAT_OK)
 			return bpf_redirect(TCP_NAT_IFINDEX(tcp_ret), egress_redirect_flags);
+		if (TCP_NAT_STATUS(tcp_ret) == TCP_NAT_PROBE)
+			return bpf_redirect(TCP_NAT_IFINDEX(tcp_ret), 0);
 		if (TCP_NAT_STATUS(tcp_ret) == TCP_L7PROXY_OK)
 			return bpf_redirect(TCP_NAT_IFINDEX(tcp_ret), BPF_F_INGRESS);
 		if (TCP_NAT_STATUS(tcp_ret) == TCP_NAT_RESET)
 			return tcp_reply_reset(skb, ifindex);
+		return TC_ACT_SHOT;
 	}
+
+	mac_result = prepare_egress_l2(skb, l2, daddr);
+	if (mac_result == EGRESS_MAC_DROP)
+		return TC_ACT_SHOT;
+	if (mac_result == EGRESS_MAC_PROBE)
+		return bpf_redirect(nodenic_ifindex, 0);
 
 	if (proto == IPPROTO_UDP) {
 		if (!__pull_headers_udp(skb, &l2, &l3, &udp))

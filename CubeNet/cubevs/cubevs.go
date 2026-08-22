@@ -34,6 +34,7 @@ type Params struct {
 	// Ifindex, IP and MAC address of Node itself
 	NodeIfindex uint32
 	NodeIP      net.IP
+	NodeIPMask  net.IPMask
 	NodeMacAddr net.HardwareAddr
 	// MAC address of the Node gateway (next hop)
 	NodeGatewayMacAddr net.HardwareAddr
@@ -238,6 +239,7 @@ const (
 	globalNameEgressDMacaddrP2     = "egress_dmacaddr_p2"
 	globalNameEgressRedirectFlags  = "egress_redirect_flags"
 	globalNameNodeIP               = "nodenic_ip"
+	globalNameNodeNetmask          = "nodenic_netmask"
 	globalNameNodeIfindex          = "nodenic_ifindex"
 	globalNameNodeMacaddrP1        = "nodenic_macaddr_p1"
 	globalNameNodeMacaddrP2        = "nodenic_macaddr_p2"

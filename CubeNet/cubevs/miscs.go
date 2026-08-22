@@ -103,6 +103,7 @@ func rewriteConstants(vars map[string]*ebpf.VariableSpec, params Params) error {
 		err = errors.Join(err, v.Set(params.EgressRedirectFlags))
 	}
 	err = errors.Join(err, vars[globalNameNodeIP].Set(ipToUint32(params.NodeIP)))
+	err = errors.Join(err, vars[globalNameNodeNetmask].Set(ipMaskToUint32(params.NodeIPMask)))
 	err = errors.Join(err, vars[globalNameNodeIfindex].Set(params.NodeIfindex))
 	err = errors.Join(err, vars[globalNameNodeMacaddrP1].Set(hardwareAddrToUint32(params.NodeMacAddr)))
 	err = errors.Join(err, vars[globalNameNodeMacaddrP2].Set(hardwareAddrToUint16(params.NodeMacAddr)))
