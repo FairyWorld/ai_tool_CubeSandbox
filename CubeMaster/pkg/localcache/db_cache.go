@@ -32,11 +32,11 @@ func (l *local) DB() *gorm.DB {
 	return l.db
 }
 
-func (l *local) loadAllFromDB() error {
-	return l.syncAllFromDB(false)
+func (l *local) loadAllFromDB(ctx context.Context) error {
+	return l.syncAllFromDB(ctx, false)
 }
 
-func (l *local) syncAllFromDB(update bool) error {
+func (l *local) syncAllFromDB(ctx context.Context, update bool) error {
 	startTime := time.Now()
 	retCode := 200
 	defer func() {
@@ -44,11 +44,13 @@ func (l *local) syncAllFromDB(update bool) error {
 	}()
 
 	if externalNodeLoader != nil {
-		nodes, err := externalNodeLoader(context.Background())
+		nodes, err := externalNodeLoader(ctx)
 		if err != nil {
 			retCode = 500
 			return err
 		}
+
+		log.G(ctx).Infof("syncAllFromDB: externalNodeLoader returned %d nodes", len(nodes))
 
 		allFromDb := make(map[string]struct{}, len(nodes))
 		for _, n := range nodes {
@@ -62,10 +64,17 @@ func (l *local) syncAllFromDB(update bool) error {
 			} else {
 				l.addNodeCache(n)
 			}
+			if n.InsID != "" {
+				log.G(ctx).Debugf("syncAllFromDB: node=%s LocalTemplates=%v", n.InsID, n.LocalTemplates)
+				SyncNodeTemplates(ctx, n.InsID, n.LocalTemplates)
+			}
 			allFromDb[n.InsID] = struct{}{}
 		}
 		if update {
-			l.checkDirty(allFromDb)
+			if len(allFromDb) == 0 {
+				log.G(ctx).Warnf("syncAllFromDB: CubeOps returned 0 nodes, cache will be cleared")
+			}
+			l.checkDirty(ctx, allFromDb)
 		}
 		return nil
 	}
@@ -130,7 +139,7 @@ func (l *local) syncAllFromDB(update bool) error {
 	}
 
 	if update {
-		l.checkDirty(allFromDb)
+		l.checkDirty(ctx, allFromDb)
 	}
 	return nil
 }

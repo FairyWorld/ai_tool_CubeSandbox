@@ -81,9 +81,28 @@ Expect:
 
 - Control-plane Pods finished rolling per Deployment strategy (`cube-master` uses Recreate; other CP Deployments use RollingUpdate)
 - Compute: matching DaemonSet Pods run the new images and are Ready
-- If you bumped Big Pod runtime: existing sandboxes on that node were interrupted; new sandboxes can be created; the node has re-registered with CubeMaster
+- If you bumped Big Pod runtime: existing sandboxes on that node were interrupted; new sandboxes can be created; the node has re-registered with CubeOps
 
 ---
+
+## Upgrade order
+
+During the cube-master → cube-ops migration, components target different endpoints. Apply upgrades in this order to keep the cluster healthy during the cutover:
+
+1. **Bring CubeOps up first (and reachable).** New cubelets with
+   `meta_server_endpoint` pointing at cube-ops fail-fast if the address is
+   unreachable, so cube-ops must be Ready before any cubelet is upgraded.
+2. **Bring CubeMaster up after CubeOps.** CubeMaster fails to start when
+   `cube_ops_addr` is set and cube-ops is down, so cube-ops must be reachable
+   before cube-master boots.
+3. **Do not mix old and new cubelets in one cluster during the cutover.**
+   Old cubelets report to cube-master `:8089`; new cubelets report to
+   cube-ops `:3010`. A mixed fleet reports inconsistent node state. Roll
+   cubelets per node, or take the entire compute plane down before
+   upgrading.
+4. **Only after the above** can you roll `cube-master`, `cube-api`, and
+   compute nodes in the order you prefer.
+
 
 ## Red lines: these operations also recreate the Big Pod
 

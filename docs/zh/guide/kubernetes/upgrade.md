@@ -81,9 +81,24 @@ kubectl rollout status deploy/cube-master -n cube-system
 
 - 控制面 Pod 按 Deployment 策略完成（`cube-master` 为 Recreate；其它控制面 Deployment 为 RollingUpdate）
 - 计算面：对应 DaemonSet 的 Pod 已换成新镜像并 Ready
-- 若升了 Big Pod 运行时：节点上存量沙箱已中断；新沙箱可创建；节点已重新注册到 CubeMaster
+- 若升了 Big Pod 运行时：节点上存量沙箱已中断；新沙箱可创建；节点已重新注册到 CubeOps
 
 ---
+
+## 升级顺序
+
+在 cube-master → cube-ops 迁移过程中，各组件的目标端点不同
+按以下顺序升级，避免切流期集群出现不一致：
+
+1. **先起 CubeOps（保证可达）。** 新 cubelet 把 `meta_server_endpoint` 指向
+   cube-ops，如果地址不可达会 fail-fast，所以必须先把 CubeOps 起好。
+2. **CubeOps 起来后再起 CubeMaster。** CubeMaster 启动时如果配了
+   `cube_ops_addr` 且 CubeOps 不通，会 fail-fast。
+3. **切流期不要新老 cubelet 同集群混跑。** 旧 cubelet 向 cube-master `:8089`
+   上报，新 cubelet 向 cube-ops `:3010` 上报；混跑会导致节点状态不一致。
+   逐节点滚动升级，或先把整个计算面停了再升。
+4. **以上就绪后**，再按需滚动 `cube-master`、`cube-api`、计算节点。
+
 
 ## 红线：这些操作也会 recreate Big Pod
 
