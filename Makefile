@@ -24,6 +24,7 @@ AGENT_EXT4_CONTAINER_DIR := /workspace/$(patsubst $(ROOT_DIR)/%,%,$(abspath $(AG
 MANUAL_DEPLOY_SCRIPT ?= $(ROOT_DIR)/deploy/one-click/deploy-manual.sh
 WEB_DIR ?= $(ROOT_DIR)/web
 CUBECOW_DIR ?= $(ROOT_DIR)/cubecow
+CUBES3LVOL_DIR ?= $(ROOT_DIR)/CubeS3lvol
 CUBELET_COW_THIRD_PARTY_DIR ?= $(ROOT_DIR)/Cubelet/third_party/cubecow
 COW_STATICLIB ?= $(CUBELET_COW_THIRD_PARTY_DIR)/lib/libcubecow.a
 COW_HEADER ?= $(CUBELET_COW_THIRD_PARTY_DIR)/include/cubecow.h
@@ -136,6 +137,8 @@ help:
 	@printf "  cubelet       Build cubelet and cubecli in Docker\n"
 	@printf "  cubevsmapdump Build CubeVS eBPF business map dump tool in Docker\n"
 	@printf "  cubecow-sdk   Build cubecow static library for Cubelet\n"
+	@printf "  cube-s3lvol   Build CubeS3lvol (s3lvol) release in Docker\n"
+	@printf "  cube-s3lvol-test Run CubeS3lvol offline integration tests in Docker\n"
 	@printf "  cubecow-smoke Build cubecow smoke test CLI in Docker\n"
 	@printf "  cubecow-test-native Build SDK artifacts and run native tests in Docker\n"
 	@printf "  cube-proxy-sidecar Build cube-proxy-sidecar (developer-only; not in 'all')\n"
@@ -232,6 +235,12 @@ builder-run: prepare-builder-home prepare-tmp-git-credentials
 ifeq ($(strip $(BUILDER_CMD)),)
 	$(error BUILDER_CMD must not be empty)
 endif
+# The container can run as a different user than the owner of files under the
+# mounted workspace. In CI, cube-s3lvol-test runs as root (0:0, DPDK EAL), but
+# deps/spdk restored from the actions/cache are owned by the runner uid, so
+# git inside the container refuses them ("dubious ownership"). Mark every repo
+# under the mounted workspace as safe -- this only relaxes that check inside
+# the throwaway container.
 	docker run --rm -i \
 		--user "$(BUILDER_USER)" \
 		-e HOME=$(BUILDER_CONTAINER_HOME) \
@@ -249,7 +258,7 @@ endif
 		$(DOCKER_GIT_CRED) \
 		-w /workspace \
 		$(BUILDER_IMAGE) \
-		bash -lc 'mkdir -p "$$HOME" "$$CARGO_HOME" "$$GOPATH" "$$HOME/.cache" "$$HOME/.config" && exec bash -lc "$$BUILDER_CMD"'
+		bash -lc 'mkdir -p "$$HOME" "$$CARGO_HOME" "$$GOPATH" "$$HOME/.cache" "$$HOME/.config" && git config --global --add safe.directory "*" && exec bash -lc "$$BUILDER_CMD"'
 
 .PHONY: cubecow-sdk
 cubecow-sdk:
@@ -261,6 +270,48 @@ ifeq ($(IN_CUBE_SANDBOX_BUILDER),1)
 else
 	$(MAKE) builder-image
 	$(MAKE) builder-run BUILDER_CMD='cd /workspace && IN_CUBE_SANDBOX_BUILDER=1 make cubecow-sdk'
+endif
+
+# cube-s3lvol: developer entrypoint for building the CubeS3lvol (s3lvol)
+# self-contained release -- the same steps as the one-click track_s3lvol,
+# but producing _output/CubeS3lvol/s3lvol-<version>/ for local iteration.
+# setup_dep.sh only pays the full SPDK/DPDK/AWS CRT compile on first run;
+# later builds reuse the builder container's persistent workspace.
+.PHONY: cube-s3lvol
+cube-s3lvol:
+ifeq ($(IN_CUBE_SANDBOX_BUILDER),1)
+	@mkdir -p "$(OUTPUT_DIR)/CubeS3lvol"
+	cd "$(CUBES3LVOL_DIR)" && AWS_BUILD_TYPE=RelWithDebInfo ./setup_dep.sh --jobs "$$(nproc)"
+	cd "$(CUBES3LVOL_DIR)" && make S3LVOL_BUILD_TYPE=release -j"$$(nproc)"
+	cd "$(CUBES3LVOL_DIR)" && ./make_release.sh --no-tar --skip-smoke --version "$(CUBE_VERSION)" --outdir "$(OUTPUT_DIR)/CubeS3lvol"
+	@printf 'CubeS3lvol release: %s/CubeS3lvol/s3lvol-*/ (bin/s3lvol_tgt + scripts/ + VERSION)\n' "$(OUTPUT_DIR)"
+else
+	$(MAKE) builder-image
+	$(MAKE) builder-run BUILDER_CMD='cd /workspace && IN_CUBE_SANDBOX_BUILDER=1 make cube-s3lvol'
+endif
+
+# cube-s3lvol-test: the CI gate (check-rules + debug make + check-offline).
+# Journal/wal/cache/local_dev tests write aio files under /data; tmpfs keeps
+# that off the host. The DPDK EAL tests (--no-huge) still need locked memory,
+# /sys cgroup/cpu topology, and a writable runtime dir; a non-root docker
+# process cannot initialise the EAL (spdk_env_init -> exit 77). Same privileged
+# root pattern as cubevs-test. Incremental setup_dep.sh / make do not rewrite
+# existing 1000-owned deps. setup_dep.sh is incremental: a populated
+# CubeS3lvol/deps/ is a no-op.
+.PHONY: cube-s3lvol-test
+cube-s3lvol-test:
+ifeq ($(IN_CUBE_SANDBOX_BUILDER),1)
+	cd "$(CUBES3LVOL_DIR)" && ./setup_dep.sh --jobs "$$(nproc)"
+	cd "$(CUBES3LVOL_DIR)" && make check-rules
+	cd "$(CUBES3LVOL_DIR)" && make -j"$$(nproc)"
+	cd "$(CUBES3LVOL_DIR)" && mkdir -p /tmp/s3lvol-dpdk && \
+		RTE_RUNTIME_DIR=/tmp/s3lvol-dpdk make check-offline
+else
+	$(MAKE) builder-image
+	$(MAKE) builder-run \
+		BUILDER_USER=0:0 \
+		BUILDER_RUN_EXTRA_MOUNTS='--privileged --tmpfs /data:rw,mode=1777 --ulimit memlock=-1' \
+		BUILDER_CMD='cd /workspace && IN_CUBE_SANDBOX_BUILDER=1 make cube-s3lvol-test'
 endif
 
 .PHONY: cubecow-clean

@@ -1,0 +1,84 @@
+name: CubeS3lvol Test
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'CubeS3lvol/**'
+      - '.github/workflows/cube-s3lvol-test.yml'
+  pull_request:
+    paths:
+      - 'CubeS3lvol/**'
+      - '.github/workflows/cube-s3lvol-test.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: cube-s3lvol-test-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: read
+
+env:
+  BUILDER_IMAGE: ghcr.io/tencentcloud/cubesandbox-builder:ubuntu2004
+
+jobs:
+  test:
+    name: CubeS3lvol offline tests
+    # Build and test run inside the published Ubuntu 20.04 builder image
+    # (python3.9 venv at /opt/s3lvol-tools, SPDK/DPDK apt deps). The runner
+    # only needs Docker.
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Log in to GitHub Container Registry
+        id: ghcr_login
+        continue-on-error: true
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Warn about GHCR login failure
+        if: steps.ghcr_login.outcome == 'failure'
+        run: echo "::warning::GHCR login failed - will attempt pull as anonymous"
+
+      # Always use the published builder. Do not docker-build Dockerfile.builder
+      # here: a local rebuild hits apt.llvm.org and is what the builder-image
+      # workflow already publishes after merge to master.
+      - name: Pull builder image
+        run: docker pull "${BUILDER_IMAGE}"
+
+      # The SPDK build (with its pinned DPDK submodule) is ten to thirty
+      # minutes, so cache the whole deps/ tree. setup_dep.sh is "build what is
+      # missing": when the cache hits, spdk_is_built() and the AWS prefix
+      # checks make every step a no-op.
+      #
+      # The key is tied to the dependency recipes and the patches; a new SPDK
+      # pin or a patch change invalidates it. The runner arch is part of the
+      # key because DPDK's build products are not portable across arches.
+      # builder-run mounts the repo at /workspace, so these paths stay on the
+      # runner and the cache still applies.
+      - name: Cache SPDK and AWS CRT build
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            CubeS3lvol/deps/spdk
+            CubeS3lvol/deps/aws
+            CubeS3lvol/deps/aws-src
+          key: s3lvol-deps-${{ runner.arch }}-${{ hashFiles('CubeS3lvol/setup_dep.sh', 'CubeS3lvol/patches/**') }}
+
+      # setup_dep.sh's own --check reports "patches applied: no" even when
+      # they are applied (it calls patches/apply.sh --check without passing
+      # SPDK_ROOT, and apply.sh defaults to ../spdk), so do not run it here:
+      # the setup step itself failing is the signal.
+      #
+      # cube-s3lvol-test runs check-rules + debug make + check-offline inside
+      # the builder. /data is a tmpfs; DPDK EAL tests need --privileged.
+      - name: Build and test in builder
+        run: make cube-s3lvol-test BUILDER_IMAGE="${BUILDER_IMAGE}"
