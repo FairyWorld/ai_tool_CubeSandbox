@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"path/filepath"
 	"strings"
 	"time"
@@ -21,6 +22,8 @@ import (
 	cubeboxstore "github.com/tencentcloud/CubeSandbox/Cubelet/pkg/store/cubebox"
 	"github.com/tencentcloud/CubeSandbox/Cubelet/storage"
 	"github.com/tencentcloud/CubeSandbox/cubelog"
+
+	"github.com/tencentcloud/CubeSandbox/CubeNet/cubevs"
 )
 
 const (
@@ -229,6 +232,14 @@ func (s *service) RollbackSandbox(ctx context.Context, req *cubebox.RollbackSand
 	// Pid/StartedAt against the live shim once RollingBack clears.
 	resetSandboxStatusAfterRollback(cb)
 
+	// The rollback restored and resumed the guest. Bump its network generation
+	// so the dataplane resets now-stale TCP sessions instead of letting them
+	// hang. Warn-only: the guest is already running, so failing the RPC over a
+	// dataplane bump would diverge master/cubelet state for a non-fatal issue.
+	if err := bumpRollbackNetworkGeneration(cb.IP); err != nil {
+		stepLog.Warnf("rollback succeeded but failed to bump network generation for sandbox %s: %v", req.GetSandboxID(), err)
+	}
+
 	newRootfs.MountName = currentRootfs.MountName
 	if err := storage.PersistSandboxRootfs(ctx, req.GetSandboxID(), newRootfs); err != nil {
 		rsp.Ret.RetCode = errorcode.ErrorCode_Unknown
@@ -333,6 +344,23 @@ func resolveRollbackTargets(ctx context.Context, backend string, req *cubebox.Ro
 		return "", "", "", "", fmt.Errorf("rollback: local snapshot catalog lookup for %s failed: %w", req.GetSnapshotID(), err)
 	}
 	return entry.RootfsVol, entry.MemoryVol, entry.MemoryKind, entry.MetaDir, nil
+}
+
+// bumpRollbackNetworkGeneration bumps the sandbox's network generation so the
+// dataplane resets now-stale TCP sessions after a rollback. Best effort; the
+// caller logs a warning on failure. It resolves the TAP ifindex from the
+// sandbox IP in O(1) via the mvmip_to_ifindex map rather than scanning every
+// TAP device.
+func bumpRollbackNetworkGeneration(sandboxIP string) error {
+	ip := net.ParseIP(sandboxIP).To4()
+	if ip == nil {
+		return fmt.Errorf("invalid sandbox IP %q", sandboxIP)
+	}
+	ifindex, err := cubevs.LookupIfindexByIP(ip)
+	if err != nil {
+		return err
+	}
+	return cubevs.BumpMvmVersion(ifindex)
 }
 
 func (s *service) buildRollbackRestoreConfig(ctx context.Context, sandboxID, metaDir string, currentRootfs, newRootfs, memory *storage.CowSnapshotObject) (string, error) {
