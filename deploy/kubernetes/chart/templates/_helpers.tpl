@@ -294,8 +294,10 @@ http {
             proxy_set_header X-Real-IP $remote_addr;
             proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
             proxy_set_header X-Forwarded-Proto $scheme;
-            proxy_read_timeout 300s;
-            proxy_send_timeout 300s;
+            client_max_body_size 8g;
+            proxy_request_buffering off;
+            proxy_read_timeout 1800s;
+            proxy_send_timeout 1800s;
 
             proxy_pass {{ $opsUpstream }}/api/;
         }
@@ -306,8 +308,9 @@ http {
             proxy_set_header X-Real-IP $remote_addr;
             proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
             proxy_set_header X-Forwarded-Proto $scheme;
-            proxy_read_timeout 300s;
-            proxy_send_timeout 300s;
+            client_max_body_size 8g;
+            proxy_read_timeout 1800s;
+            proxy_send_timeout 1800s;
 
             rewrite ^/cubeapi/v1/(.*)$ /api/v1/sdk/$1 break;
             proxy_pass {{ $opsUpstream }};
@@ -328,8 +331,9 @@ http {
             proxy_set_header X-Real-IP $remote_addr;
             proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
             proxy_set_header X-Forwarded-Proto $scheme;
-            proxy_read_timeout 300s;
-            proxy_send_timeout 300s;
+            client_max_body_size 8g;
+            proxy_read_timeout 1800s;
+            proxy_send_timeout 1800s;
 
             rewrite ^/(.*)$ /api/v1/sdk/$1 break;
             proxy_pass {{ $opsUpstream }};
@@ -472,6 +476,15 @@ see validate.yaml) to avoid the double generation entirely.
 {{- end -}}
 {{- end -}}
 
+{{/* Join a string or list into a comma-separated CubeOps warehouse env value. */}}
+{{- define "cube.csvOrString" -}}
+{{- if kindIs "string" . -}}
+{{- . -}}
+{{- else -}}
+{{- join "," . -}}
+{{- end -}}
+{{- end -}}
+
 {{- define "cube.mysqlPVCName" -}}
 {{- if .Values.mysql.persistence.existingClaim -}}
 {{- .Values.mysql.persistence.existingClaim -}}
@@ -584,6 +597,66 @@ chart-owned StorageClass). This helper only picks which SC name a PVC binds to.
 
 {{- define "cube.minioEndpoint" -}}
 {{- printf "http://%s.%s.svc.%s:%v" (include "cube.minioName" .) .Release.Namespace (include "cube.clusterDomain" .) (.Values.minio.port | default 9000) -}}
+{{- end -}}
+
+{{/*
+Render a bool env value that defaults to true. Helm's `default` treats
+false as empty, so callers must not use `| default true` for these knobs.
+*/}}
+{{- define "cube.boolEnvDefaultTrue" -}}
+{{- if kindIs "bool" . -}}
+{{- ternary "true" "false" . -}}
+{{- else -}}
+true
+{{- end -}}
+{{- end -}}
+
+{{/*
+cubeOps.s3.endpoint > volumeS3.endpoint > chart MinIO.
+*/}}
+{{- define "cube.opsS3Endpoint" -}}
+{{- $s3 := default dict .Values.cubeOps.s3 -}}
+{{- if ne (($s3.endpoint) | default "") "" -}}
+{{- $s3.endpoint -}}
+{{- else if ne (((.Values.volumeS3).endpoint) | default "") "" -}}
+{{- .Values.volumeS3.endpoint -}}
+{{- else if eq (include "cube.minioBuiltinEnabled" .) "true" -}}
+{{- include "cube.minioEndpoint" . -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "cube.opsS3NodeEndpoint" -}}
+{{- $s3 := default dict .Values.cubeOps.s3 -}}
+{{- if ne (($s3.nodeEndpoint) | default "") "" -}}
+{{- $s3.nodeEndpoint -}}
+{{- else -}}
+{{- include "cube.opsS3Endpoint" . -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "cube.opsS3SecretName" -}}
+{{- $s3 := default dict .Values.cubeOps.s3 -}}
+{{- if ne (($s3.existingSecret) | default "") "" -}}
+{{- $s3.existingSecret -}}
+{{- else -}}
+{{- include "cube.secretName" . -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "cube.opsS3Bucket" -}}
+{{- $s3 := default dict .Values.cubeOps.s3 -}}
+{{- $s3.bucket | default "cube-ops" -}}
+{{- end -}}
+
+{{- define "cube.opsS3Region" -}}
+{{- $s3 := default dict .Values.cubeOps.s3 -}}
+{{- if ne (($s3.region) | default "") "" -}}
+{{- $s3.region -}}
+{{- else if ne (((.Values.volumeS3).region) | default "") "" -}}
+{{- .Values.volumeS3.region -}}
+{{- else -}}
+us-east-1
+{{- end -}}
 {{- end -}}
 
 {{/*
