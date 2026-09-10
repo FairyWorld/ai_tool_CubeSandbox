@@ -210,8 +210,12 @@ func listTemplatesFromDB(ctx context.Context) ([]TemplateInfo, error) {
 		Order("updated_at desc").Find(&defs).Error; err != nil {
 		return nil, err
 	}
+	// Only CREATE/REDO jobs carry the source image identity used for display.
+	// A COMMIT/MIGRATE/snapshot row carries no source image ref, and a MIGRATE
+	// row would otherwise win the attempt_no ordering and blank image_info.
 	var jobs []models.TemplateImageJob
 	if err := store.db.WithContext(ctx).Table(constants.TemplateImageJobTableName).
+		Where("operation IN ?", createRedoJobOperations).
 		Order("template_id asc, attempt_no desc, id desc").Find(&jobs).Error; err != nil {
 		return nil, err
 	}
@@ -997,7 +1001,10 @@ func getTemplateInfoFromDB(ctx context.Context, templateID string) (*TemplateInf
 	out := &info
 	out.CreatedAt = formatUTCRFC3339(def.CreatedAt)
 	out.ImageInfo = extractImageInfoFromRequestJSON(def.RequestJSON)
-	if latestJob, jobErr := getLatestTemplateImageJobByTemplateID(ctx, templateID); jobErr == nil && latestJob != nil {
+	// Display fields come from the latest CREATE/REDO job only: a MIGRATE job
+	// carries no source image ref, and letting it win the attempt_no ordering
+	// would blank image_info right after `tpl merge`.
+	if latestJob, jobErr := getLatestCreateRedoImageJobByTemplateIDTx(store.db.WithContext(ctx), templateID); jobErr == nil && latestJob != nil {
 		out.ImageInfo = composeImageInfo(latestJob.SourceImageRef, latestJob.SourceImageDigest)
 		out.JobID = latestJobIDFromJob(latestJob)
 	}
