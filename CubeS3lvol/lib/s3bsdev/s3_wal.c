@@ -253,9 +253,18 @@ wal_update_state(struct s3_wal *wal)
 }
 
 bool
-s3_wal_is_backpressured(const struct s3_wal *wal)
+s3_wal_should_force_flush(const struct s3_wal *wal)
 {
-	return wal && wal->state == S3_WAL_BACKPRESSURE;
+	uint64_t cap;
+
+	if (!wal) {
+		return false;
+	}
+	cap = wal_capacity(wal);
+	if (cap == 0) {
+		return false;
+	}
+	return wal_used(wal) * 100 >= cap * S3_WAL_FLUSH_FORCE_PCT;
 }
 
 /* ==========================================================================
@@ -1693,13 +1702,13 @@ s3_wal_replay(struct s3_wal *wal, s3_wal_replay_cb apply_fn, void *apply_arg,
  * Truncation
  * ========================================================================== */
 
-void
+bool
 s3_wal_truncate_to_seq(struct s3_wal *wal, uint64_t safe_seq)
 {
 	uint32_t released = 0;
 
 	if (!wal || !wal->seg_max_seq) {
-		return;
+		return false;
 	}
 
 	/* Never truncate during a replay.
@@ -1713,13 +1722,19 @@ s3_wal_truncate_to_seq(struct s3_wal *wal, uint64_t safe_seq)
 	 * that window would lose acknowledged writes, because recovery would
 	 * restart from the advanced ckpt_head.
 	 *
-	 * The situation is reachable: the flusher is already running while the WAL
-	 * replay is in flight, since s3_bs_dev_attach_wal() has to precede it so
-	 * that the overlay exists. Skipping a round costs nothing -- the flusher
-	 * calls this again on its next tick.
+	 * This is a normal-path race, not a corner: s3_bs_dev_attach_wal() has to
+	 * precede the replay so the overlay exists, so the flusher is live for the
+	 * whole of it and calls here on every tick. The lvstore only takes its
+	 * scheduling hold after the replay, for the blobstore load, so the flusher
+	 * draining the backlog while the replay fills it is exactly what keeps peak
+	 * overlay occupancy bounded.
+	 *
+	 * A caller that memos what it asked for must go by the return value, not by
+	 * what it passed: this early exit releases nothing, and a memo written from
+	 * the argument would record a truncation that never happened.
 	 */
 	if (wal->busy) {
-		return;
+		return false;
 	}
 
 	/* Segment granularity is the whole point: a segment is either entirely
@@ -1750,7 +1765,7 @@ s3_wal_truncate_to_seq(struct s3_wal *wal, uint64_t safe_seq)
 	}
 
 	if (released == 0) {
-		return;
+		return false;
 	}
 
 	/* Replay must start where the live data now starts. Leaving ckpt_head
@@ -1760,6 +1775,7 @@ s3_wal_truncate_to_seq(struct s3_wal *wal, uint64_t safe_seq)
 	wal->stats.segments_released += released;
 
 	wal_update_state(wal);
+	return true;
 }
 
 /* ==========================================================================

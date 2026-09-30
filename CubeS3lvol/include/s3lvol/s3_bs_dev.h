@@ -176,6 +176,10 @@ void s3_bs_dev_set_reap_cb(struct spdk_bs_dev *bs_dev, s3_bs_dev_reap_cb cb_fn,
 int s3_bs_dev_wal_apply(struct spdk_bs_dev *bs_dev,
 			const struct s3_wal_entry_hdr *hdr, const void *payload);
 
+/** Overlay occupancy at the moment WAL replay completes (not after it has
+ *  drained), for attach diagnostics. */
+void s3_bs_dev_log_overlay(struct spdk_bs_dev *bs_dev);
+
 /**
  * Wait until everything acknowledged so far has reached S3 (INV2).
  *
@@ -183,8 +187,42 @@ int s3_bs_dev_wal_apply(struct spdk_bs_dev *bs_dev,
  * while blobstore is still up, but it is not sufficient on its own: unloading
  * writes more metadata, which destroy() then has to flush. Without a WAL this
  * completes immediately, since a finished write is already in S3.
+ *
+ * \param timeout_us 0 selects S3_FLUSHER_DRAIN_TIMEOUT_US. A caller that is
+ *                   about to pause I/O for the length of this call wants a
+ *                   shorter one: a workload that keeps writing never lets the
+ *                   overlay go clean, so the drain runs to its deadline and the
+ *                   whole of it is added to the pause.
  */
-void s3_bs_dev_drain(struct spdk_bs_dev *bs_dev, s3_bs_dev_cb cb_fn, void *cb_arg);
+void s3_bs_dev_drain(struct spdk_bs_dev *bs_dev, uint64_t timeout_us,
+		     s3_bs_dev_cb cb_fn, void *cb_arg);
+
+/**
+ * Stop background uploads after current uploads have completed.
+ *
+ * \param timeout_us 0 selects S3_FLUSHER_SUSPEND_TIMEOUT_US;
+ *                   S3_FLUSHER_NO_SUSPEND_TIMEOUT waits without one. The
+ *                   callback reports 0 only when uploads are actually held;
+ *                   -ETIMEDOUT (deadline passed) and -ECANCELED (released again
+ *                   by an early resume or a drain) both mean they are not, so
+ *                   the caller must not treat either as a hold.
+ */
+void s3_bs_dev_suspend_flusher(struct spdk_bs_dev *bs_dev, uint64_t timeout_us,
+			       s3_bs_dev_cb cb_fn, void *cb_arg);
+
+/** Re-enable a flusher suspended by s3_bs_dev_suspend_flusher(). */
+void s3_bs_dev_resume_flusher(struct spdk_bs_dev *bs_dev);
+
+/**
+ * Schedule s3_flusher_resume() to run after \c delay_us, replacing any resume
+ * already scheduled.
+ *
+ * Does not care whether the flusher is suspended: attach calls it just before
+ * taking its hold, so the grace runs from when the hold is taken rather than
+ * from when it completes. Resuming directly cancels the pending grace.
+ */
+void s3_bs_dev_schedule_flusher_resume(struct spdk_bs_dev *bs_dev,
+				       uint64_t delay_us);
 
 /**
  * Nudge the flusher. Only useful for tests and for shutdown paths that want to
